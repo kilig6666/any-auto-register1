@@ -3,12 +3,197 @@ Sentinel Token 生成器模块
 基于对 sentinel.openai.com SDK 的逆向分析
 """
 
+import base64
 import json
+import os
+import random
+import subprocess
+import tempfile
 import time
 import uuid
-import random
-import base64
-import hashlib
+from pathlib import Path
+from shutil import which
+from urllib.request import Request, urlopen
+
+
+SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
+SENTINEL_SDK_VERSION = os.getenv("OPENAI_SENTINEL_SDK_VERSION", "20260219f9f6")
+SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
+SENTINEL_REFERER = (
+    f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_SDK_VERSION}"
+)
+
+
+def _resolve_vm_script() -> Path | None:
+    direct_script = os.getenv("OPENAI_SENTINEL_VM_SCRIPT", "").strip()
+    if direct_script:
+        path = Path(direct_script).expanduser().resolve()
+        if path.exists() and path.is_file():
+            return path
+
+    vm_dir = os.getenv("OPENAI_SENTINEL_VM_DIR", "").strip()
+    if vm_dir:
+        candidate = Path(vm_dir).expanduser().resolve() / "openai_sentinel_vm.js"
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    # 默认尝试工作区同级目录：D:/Develop/AI/sentinel/openai_sentinel_vm.js
+    candidate = (
+        Path(__file__).resolve().parents[3] / "sentinel" / "openai_sentinel_vm.js"
+    )
+    if candidate.exists() and candidate.is_file():
+        return candidate
+    return None
+
+
+def _resolve_node_binary() -> str | None:
+    node_env = os.getenv("OPENAI_SENTINEL_NODE_PATH", "").strip()
+    if node_env:
+        path = Path(node_env).expanduser().resolve()
+        if path.exists() and path.is_file():
+            return str(path)
+    return which("node")
+
+
+def _ensure_sdk_file() -> Path | None:
+    direct = os.getenv("OPENAI_SENTINEL_SDK_FILE", "").strip()
+    if direct:
+        path = Path(direct).expanduser().resolve()
+        if path.exists() and path.is_file():
+            return path
+
+    cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-cache" / SENTINEL_SDK_VERSION
+    cache_file = cache_dir / "sdk.js"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        return cache_file
+
+    request = Request(
+        SENTINEL_SDK_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://auth.openai.com/",
+            "Accept": "*/*",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            cache_file.write_bytes(response.read())
+    except Exception:
+        return None
+
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        return cache_file
+    return None
+
+
+def _vm_browser_payload(device_id: str, user_agent: str | None) -> dict:
+    return {
+        "device_id": str(device_id or "").strip(),
+        "user_agent": user_agent
+        or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ),
+        "language": "zh-CN",
+        "languages": ["zh-CN", "zh"],
+        "hardware_concurrency": 12,
+        "screen_width": 1366,
+        "screen_height": 768,
+        "performance_now": 12345.67,
+        "time_origin": 1710000000000.0,
+        "js_heap_size_limit": 4294967296,
+    }
+
+
+def _run_vm(action: str, payload: dict) -> dict | None:
+    node_binary = _resolve_node_binary()
+    vm_script = _resolve_vm_script()
+    sdk_file = _ensure_sdk_file()
+    if not node_binary or not vm_script or not sdk_file:
+        return None
+
+    full_payload = {"action": action, "sdk_path": str(sdk_file), **(payload or {})}
+    timeout_sec = int(os.getenv("OPENAI_SENTINEL_VM_TIMEOUT_SEC", "40") or "40")
+
+    try:
+        process = subprocess.run(
+            [node_binary, str(vm_script)],
+            input=json.dumps(full_payload, separators=(",", ":")),
+            text=True,
+            capture_output=True,
+            cwd=str(vm_script.parent),
+            timeout=max(5, timeout_sec),
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if process.returncode != 0:
+        return None
+    output = str(process.stdout or "").strip()
+    if not output:
+        return None
+    try:
+        data = json.loads(output)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _build_sentinel_token_via_vm(
+    session,
+    device_id,
+    *,
+    flow="authorize_continue",
+    user_agent=None,
+    sec_ch_ua=None,
+    impersonate=None,
+):
+    payload = _vm_browser_payload(str(device_id or ""), user_agent)
+    req_data = _run_vm("requirements", payload)
+    request_p = str((req_data or {}).get("request_p") or "").strip()
+    if not request_p:
+        return None
+
+    challenge = fetch_sentinel_challenge(
+        session,
+        device_id,
+        flow=flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+        request_p=request_p,
+    )
+    if not challenge:
+        return None
+    c_value = str(challenge.get("token") or "").strip()
+    if not c_value:
+        return None
+
+    solved = _run_vm(
+        "solve",
+        {**payload, "request_p": request_p, "challenge": challenge},
+    )
+    final_p = str((solved or {}).get("final_p") or (solved or {}).get("p") or "").strip()
+    if not final_p:
+        return None
+    t_value = (solved or {}).get("t")
+
+    return json.dumps(
+        {
+            "p": final_p,
+            "t": "" if t_value is None else str(t_value),
+            "c": c_value,
+            "id": device_id,
+            "flow": flow,
+        },
+        separators=(",", ":"),
+    )
 
 
 class SentinelTokenGenerator:
@@ -138,23 +323,37 @@ class SentinelTokenGenerator:
         return "gAAAAAC" + data
 
 
-def fetch_sentinel_challenge(session, device_id, flow="authorize_continue", user_agent=None, sec_ch_ua=None, impersonate=None):
+def fetch_sentinel_challenge(
+    session,
+    device_id,
+    flow="authorize_continue",
+    user_agent=None,
+    sec_ch_ua=None,
+    impersonate=None,
+    request_p=None,
+):
     """调用 sentinel 后端 API 获取 challenge 数据"""
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    request_p = str(request_p or "").strip() or generator.generate_requirements_token()
     req_body = {
-        "p": generator.generate_requirements_token(),
+        "p": request_p,
         "id": device_id,
         "flow": flow,
     }
     
     headers = {
         "Content-Type": "text/plain;charset=UTF-8",
-        "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Referer": SENTINEL_REFERER,
         "Origin": "https://sentinel.openai.com",
         "User-Agent": user_agent or "Mozilla/5.0",
         "sec-ch-ua": sec_ch_ua or '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
 
     kwargs = {
@@ -166,7 +365,7 @@ def fetch_sentinel_challenge(session, device_id, flow="authorize_continue", user
         kwargs["impersonate"] = impersonate
 
     try:
-        resp = session.post("https://sentinel.openai.com/backend-api/sentinel/req", **kwargs)
+        resp = session.post(SENTINEL_REQ_URL, **kwargs)
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -177,7 +376,25 @@ def fetch_sentinel_challenge(session, device_id, flow="authorize_continue", user
 
 def build_sentinel_token(session, device_id, flow="authorize_continue", user_agent=None, sec_ch_ua=None, impersonate=None):
     """构建完整的 openai-sentinel-token JSON 字符串"""
-    challenge = fetch_sentinel_challenge(session, device_id, flow=flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua, impersonate=impersonate)
+    vm_token = _build_sentinel_token_via_vm(
+        session,
+        device_id,
+        flow=flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+    )
+    if vm_token:
+        return vm_token
+
+    challenge = fetch_sentinel_challenge(
+        session,
+        device_id,
+        flow=flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+        impersonate=impersonate,
+    )
     
     if not challenge:
         return None

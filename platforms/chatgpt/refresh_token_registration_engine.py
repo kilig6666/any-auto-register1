@@ -833,9 +833,15 @@ class RefreshTokenRegistrationEngine:
             body_preview = response.text[:200]
             self._log(f"账户创建失败: {body_preview}", "warning")
 
-            should_retry = response.status_code in (400, 403) and (
-                "sentinel" in body_preview.lower()
-                or "registration_disallowed" in body_preview.lower()
+            body_lower = body_preview.lower()
+            should_retry = response.status_code in (400, 403) and any(
+                marker in body_lower
+                for marker in (
+                    "sentinel",
+                    "registration_disallowed",
+                    "failed to create account",
+                    "please try again",
+                )
             )
             if not should_retry:
                 return False
@@ -985,11 +991,52 @@ class RefreshTokenRegistrationEngine:
                 auth_base="https://auth.openai.com",
             )
 
+        final_status = response.status_code
         body_text = response.text[:200]
-        if response.status_code == 400 and "already_exists" in body_text.lower():
+        if final_status == 400 and "already_exists" in body_text.lower():
             return "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
 
-        self._log(f"OAuth about-you create_account 失败: {response.status_code} {body_text}", "warning")
+        body_lower = body_text.lower()
+        should_retry = final_status in (400, 403) and any(
+            marker in body_lower
+            for marker in (
+                "sentinel",
+                "registration_disallowed",
+                "failed to create account",
+                "please try again",
+            )
+        )
+        if should_retry:
+            retry_token = self._check_sentinel(
+                self._device_id or "",
+                flow="oauth_create_account",
+            )
+            if retry_token:
+                headers["openai-sentinel-token"] = retry_token
+                try:
+                    retry_resp = self.session.post(
+                        OPENAI_API_ENDPOINTS["create_account"],
+                        headers=headers,
+                        data=json.dumps(user_info),
+                    )
+                    if retry_resp.status_code == 200:
+                        retry_data = retry_resp.json() or {}
+                        return normalize_flow_url(
+                            str(retry_data.get("continue_url") or ""),
+                            auth_base="https://auth.openai.com",
+                        )
+                    final_status = retry_resp.status_code
+                    body_text = retry_resp.text[:200]
+                except Exception as e:
+                    self._log(
+                        f"OAuth about-you create_account 重试失败: {e}",
+                        "warning",
+                    )
+
+        self._log(
+            f"OAuth about-you create_account 失败: {final_status} {body_text}",
+            "warning",
+        )
         return ""
 
     def _resolve_post_otp_continue_url(self) -> str:
